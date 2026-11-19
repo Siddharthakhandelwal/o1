@@ -728,7 +728,8 @@ def train(args):
     )
     scheduler = WarmupCosineScheduler(
         optimizer, args.warmup_epochs, args.epochs, args.lr, min_lr_ratio=0.01)
-    scaler = GradScaler("cuda", enabled=torch.cuda.is_available())
+    scaler = GradScaler("cuda", init_scale=4096.0,
+                        enabled=args.amp and torch.cuda.is_available())
 
     # ── Checkpoint resume ────────────────────────────────────────────────────
     start_epoch    = 1
@@ -748,6 +749,8 @@ def train(args):
                 print(f"  Loaded optimizer state")
             except Exception as e:
                 print(f"  Could not load optimizer state ({e}) — starting fresh")
+        if "scaler_state_dict" in ckpt and scaler.is_enabled():
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_epoch    = ckpt.get("epoch", 1) + 1
         best_probe_acc = ckpt.get("probe_acc", 0.0)
         scheduler.set_epoch(start_epoch - 1)
@@ -787,7 +790,7 @@ def train(args):
             lbl = lbl.to(device, non_blocking=True)
             rad_target = rad_target.to(device, non_blocking=True)
 
-            with autocast("cuda", enabled=torch.cuda.is_available()):
+            with autocast("cuda", enabled=args.amp and torch.cuda.is_available()):
                 q1, k2, q2, k1, feat1, z1, z2, z3 = model(v1, v2, v3)
 
                 # ── MoCo v3 symmetric contrastive loss ───────────────────────
@@ -822,8 +825,19 @@ def train(args):
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 if not torch.isfinite(grad_norm):
+                    if not scaler.is_enabled():
+                        optimizer.zero_grad(set_to_none=True)
+                        raise FloatingPointError("Non-finite gradient norm with AMP disabled")
+                    # GradScaler recorded the overflow during unscale_; step()
+                    # skips this update and update() lowers the scale for retry.
+                    old_scale = scaler.get_scale()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    new_scale = scaler.get_scale()
                     optimizer.zero_grad(set_to_none=True)
-                    raise FloatingPointError("Non-finite gradient norm during SSL preflight/training")
+                    print(f"  [AMP] skipped overflowed optimizer update at epoch {epoch}, "
+                          f"batch {step + 1}; scale {old_scale:g} -> {new_scale:g}")
+                    continue
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -861,6 +875,7 @@ def train(args):
             torch.save({
                 "epoch": epoch, "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
                 "args": vars(args), "split_manifest": args.split_manifest,
                 "split_hash": split_hash,
                 "radiomics_mean": rad_mean, "radiomics_std": rad_std,
@@ -872,6 +887,7 @@ def train(args):
     torch.save({
         "epoch": args.epochs, "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(), "args": vars(args),
+        "scaler_state_dict": scaler.state_dict(),
         "split_manifest": args.split_manifest,
         "split_hash": split_hash,
         "radiomics_mean": rad_mean, "radiomics_std": rad_std,
@@ -936,7 +952,9 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--preflight_steps", type=int, default=0,
                    help="Stop each epoch after this many batches for a smoke run")
-    p.add_argument("--amp", action="store_true", default=True)
+    p.add_argument("--amp", dest="amp", action="store_true", default=True)
+    p.add_argument("--no_amp", dest="amp", action="store_false",
+                   help="Disable CUDA mixed precision if AMP remains unstable")
 
     return p.parse_args()
 

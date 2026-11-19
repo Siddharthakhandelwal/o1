@@ -183,9 +183,20 @@ def load_talisman_patches(limit=0):
 
 
 def _slice_number(path):
-    """Return final numeric token used by this dataset's CT/mask filenames."""
-    match = re.search(r"(\d+)(?=\.dcm$)", os.path.basename(path), re.IGNORECASE)
-    return int(match.group(1)) if match else None
+    """Return the DICOM InstanceNumber shared by each CT/mask slice pair.
+
+    CT filenames contain SOP identifiers while mask filenames use ROI counters,
+    so their trailing filename numbers are different and must not be used to pair.
+    """
+    try:
+        ds = pydicom.dcmread(
+            str(path), stop_before_pixels=True, force=True,
+            specific_tags=["InstanceNumber"],
+        )
+        value = getattr(ds, "InstanceNumber", None)
+        return int(value) if value is not None else None
+    except Exception:
+        return None
 
 
 # ============================================================
