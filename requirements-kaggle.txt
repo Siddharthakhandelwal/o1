@@ -1,0 +1,10 @@
+# Kaggle supplies a CUDA-enabled PyTorch build; do not replace it here.
+numpy
+scipy
+scikit-image
+scikit-learn
+pydicom
+tifffile
+pandas
+openpyxl
+xlrd

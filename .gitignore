@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Dataset, clinical files, and derived data
+ILD_DB/
+ILD_DB.zip
+*.xlsx
+*.npz
+outputs/
+processed/
+
+# Model outputs and local logs
+*.pth
+*.pt
+*.ckpt
+*.csv
+
+# Local temporary files and source documents
+/tmp/
+tmp/
+*.pdf
+*.zip
+paper_figures/
