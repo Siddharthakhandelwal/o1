@@ -4,10 +4,6 @@ Code and Kaggle workflow for the RadioSSL ILD CT patch representation project.
 
 ## Run on Kaggle
 
-1. Add the original `ILD_DB.zip` as a Kaggle Dataset input.
-2. Open `RadioSSL_Kaggle_runbook.ipynb` in Kaggle and enable Internet and a P100 GPU.
-3. Set `DATASET_ZIP` to the attached archive path, then run notebook cells in order.
-
-The preprocessing creates separate training and validation NPZ files. Volume ROI and HRCT pilot cases are used for training. Talisman patients whose numeric IDs also occur in training are excluded from validation; sentinel `-1` patches are excluded unless explicitly enabled.
+Open `RadioSSL_Kaggle_runbook.ipynb` in Kaggle, attach the extracted ILD dataset, enable Internet and a GPU, and run notebook cells in order. The notebook discovers `ILD_DB_volumeROIs` under `/kaggle/input`, combines Talisman and volume/pilot patches, and performs a patient-grouped 75/25 split before SSL. All rows for a matching patient ID stay together; patient `-1` sentinel rows are always training-only.
 
 Do not commit the source dataset, protected clinical workbook, generated NPZ files, checkpoints, or training logs.

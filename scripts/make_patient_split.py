@@ -27,47 +27,42 @@ def build_split(data_path: Path, output_path: Path, test_size: float, seed: int,
     if len(labels) != len(pids):
         raise ValueError("labels and patient_ids have different row counts")
 
-    # -1 means no known patient (Talisman training-only rows); it can never be
-    # used as a validation/test group. All real IDs are kept intact by GSS.
+    # Split only real patient groups. Sentinel -1 has no known identity and is
+    # appended to training after GSS, as required by the dataset README.
     sentinel = pids == -1
     real = ~sentinel
     if not real.any():
         raise ValueError("No rows have a real patient ID")
-    best_score = 0.0
-    if test_size == 0:
-        # Use every eligible volume row for SSL when the separate Talisman
-        # archive is the locked patient-disjoint evaluation set.
-        train_idx = np.arange(len(labels), dtype=np.int64)
-        test_idx = np.empty(0, dtype=np.int64)
-    else:
-        classes = np.unique(labels[(labels >= 0) & real])
-        if len(classes) < 2:
-            raise ValueError("Need at least two labelled classes among real patients")
+    classes = np.unique(labels[(labels >= 0) & real])
+    if len(classes) < 2:
+        raise ValueError("Need at least two labelled classes among real patients")
 
-        best = None
-        best_score = float("inf")
-        for offset in range(trials):
-            splitter = GroupShuffleSplit(n_splits=1, test_size=test_size,
-                                         random_state=seed + offset)
-            train_local, test_local = next(splitter.split(
-                np.zeros(real.sum()), labels[real], groups=pids[real]))
-            real_rows = np.flatnonzero(real)
-            tr_real, te = real_rows[train_local], real_rows[test_local]
-            tr = np.concatenate([np.flatnonzero(sentinel), tr_real])
-            # Select split by class representation only, never by model results.
-            tr_dist = np.array([(labels[tr] == c).sum() for c in classes], dtype=float)
-            te_dist = np.array([(labels[te] == c).sum() for c in classes], dtype=float)
-            if (tr_dist == 0).any() or (te_dist == 0).any():
-                continue
-            tr_dist /= tr_dist.sum()
-            te_dist /= te_dist.sum()
-            score = float(np.abs(tr_dist - te_dist).sum())
-            if score < best_score:
-                best_score = score
-                best = (np.sort(tr), np.sort(te))
-        if best is None:
-            raise ValueError("Could not find a split containing every class on both sides")
-        train_idx, test_idx = best
+    best = None
+    best_score = float("inf")
+    for offset in range(trials):
+        splitter = GroupShuffleSplit(n_splits=1, test_size=test_size,
+                                     random_state=seed + offset)
+        train_local, test_local = next(splitter.split(
+            np.zeros(real.sum()), labels[real], groups=pids[real]))
+        real_rows = np.flatnonzero(real)
+        tr_real, te = real_rows[train_local], real_rows[test_local]
+        # Select split by class representation only, never by model results.
+        # Sentinel rows are deliberately excluded from split selection and
+        # added only after the 75/25 real-patient split has been selected.
+        tr_dist = np.array([(labels[tr_real] == c).sum() for c in classes], dtype=float)
+        te_dist = np.array([(labels[te] == c).sum() for c in classes], dtype=float)
+        if (tr_dist == 0).any() or (te_dist == 0).any():
+            continue
+        tr_dist /= tr_dist.sum()
+        te_dist /= te_dist.sum()
+        score = float(np.abs(tr_dist - te_dist).sum())
+        if score < best_score:
+            best_score = score
+            best = (np.sort(tr_real), np.sort(te))
+    if best is None:
+        raise ValueError("Could not find a split containing every class on both sides")
+    train_real_idx, test_idx = best
+    train_idx = np.sort(np.concatenate([np.flatnonzero(sentinel), train_real_idx]))
     train_groups = set(map(int, np.unique(pids[train_idx][pids[train_idx] >= 0])))
     test_groups = set(map(int, np.unique(pids[test_idx])))
     if train_groups & test_groups:
@@ -82,7 +77,9 @@ def build_split(data_path: Path, output_path: Path, test_size: float, seed: int,
         "data_sha256": digest,
         "seed": seed,
         "test_size_requested": test_size,
-        "evaluation_mode": "external_validation_only" if test_size == 0 else "internal_patient_holdout",
+        "split_fraction_basis": "unique non-sentinel patient IDs, not patch rows",
+        "sentinel_policy": "all patient_id -1 rows are forced into training after GroupShuffleSplit",
+        "evaluation_mode": "combined_dataset_patient_group_holdout",
         "split_search_trials": trials,
         "class_balance_l1": best_score,
         "train_indices": train_idx.tolist(),
@@ -104,14 +101,14 @@ def main():
     parser.add_argument("--data_path", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--test_size", type=float, default=0.25,
-                        help="Use 0 when a separate patient-disjoint validation NPZ is held out")
+                        help="Fraction of real patient groups assigned to test (default: 0.25)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--trials", type=int, default=200)
     parser.add_argument("--patient_ids_same_namespace", action="store_true",
                         help="Confirm verified source mapping uses shared numeric patient IDs")
     args = parser.parse_args()
-    if not 0 <= args.test_size < 1:
-        parser.error("--test_size must be in [0, 1)")
+    if not 0 < args.test_size < 1:
+        parser.error("--test_size must be in (0, 1); a patient holdout is required")
     result = build_split(Path(args.data_path), Path(args.output), args.test_size, args.seed,
                          args.trials, args.patient_ids_same_namespace)
     print(f"train rows={len(result['train_indices'])} test rows={len(result['test_indices'])}")

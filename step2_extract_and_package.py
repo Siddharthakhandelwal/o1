@@ -320,9 +320,8 @@ def _atomic_save_npz(path, arrays):
     os.replace(temp_path, path)
 
 
-def standardize_and_package(include_talisman_sentinel_train=False,
-                            patient_limit=0, talisman_limit=0):
-    """Build separate train (volume/pilot) and held-out Talisman NPZ files."""
+def standardize_and_package(patient_limit=0, talisman_limit=0):
+    """Package all patch sources once; patient grouping happens before SSL."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     tal = load_talisman_patches(limit=talisman_limit)
     vol = extract_volume_patches(patient_limit=patient_limit)
@@ -331,73 +330,52 @@ def standardize_and_package(include_talisman_sentinel_train=False,
     (vol_patches, vol_labels, vol_pids, vol_sources, vol_ext,
      vol_paths, vol_slices, vol_rows, vol_cols) = vol
 
-    # Volume/pilot cases are the training cohort. Talisman is validation-only,
-    # but Talisman patients whose IDs also occur in training must be removed
-    # from validation to preserve patient-disjoint evaluation.
-    volume_patient_ids = set(int(x) for x in vol_pids)
-    tal_real_mask = np.asarray(tal_pids) >= 0
-    tal_real_ids = set(int(x) for x in np.asarray(tal_pids)[tal_real_mask])
-    overlap_ids = tal_real_ids & volume_patient_ids
-    val_mask = np.asarray([
-        bool(is_real) and int(pid) not in volume_patient_ids
-        for is_real, pid in zip(tal_real_mask, tal_pids)
-    ], dtype=bool)
-
-    train_rows = [list(x) for x in zip(vol_patches, vol_labels, vol_pids, vol_sources,
-                                       vol_ext, vol_paths, vol_slices, vol_rows, vol_cols)]
+    # One combined archive is split later by patient ID. Identical IDs across
+    # Talisman, volume ROIs and pilot cases therefore always share one partition.
     sentinel_count = sum(int(pid) == -1 for pid in tal_pids)
-    if include_talisman_sentinel_train:
-        train_rows.extend([list(row) for row, pid in zip(zip(tal_patches, tal_labels, tal_pids,
-            tal_sources, tal_ext, tal_paths, tal_slices, tal_rows, tal_cols), tal_pids) if int(pid) == -1])
+    tal_rows = zip(tal_patches, tal_labels, tal_pids, tal_sources, tal_ext,
+                   tal_paths, tal_slices, tal_rows, tal_cols)
+    vol_rows = zip(vol_patches, vol_labels, vol_pids, vol_sources, vol_ext,
+                   vol_paths, vol_slices, vol_rows, vol_cols)
+    combined_rows = list(tal_rows) + list(vol_rows)
+    combined_tuple = tuple([row[i] for row in combined_rows] for i in range(9))
+    arrays = _package_subset(*combined_tuple)
 
-    def unzip_rows(rows):
-        return tuple([row[i] for row in rows] for i in range(9))
-    train_tuple = unzip_rows(train_rows)
-    tal_rows_all = list(zip(tal_patches, tal_labels, tal_pids, tal_sources, tal_ext,
-                            tal_paths, tal_slices, tal_rows, tal_cols))
-    val_tuple = tuple([row[field] for index, row in enumerate(tal_rows_all) if val_mask[index]]
-                      for field in range(9))
-    # The comprehension above selects one field at a time to avoid a second
-    # full-size copy of the TIFF patch list.
-    train_arrays = _package_subset(*train_tuple)
-    validation_arrays = _package_subset(*val_tuple)
+    combined_path = os.path.join(OUTPUT_DIR, "ild_dataset_combined.npz")
+    _atomic_save_npz(combined_path, arrays)
 
-    train_path = os.path.join(OUTPUT_DIR, "ild_train_dataset.npz")
-    validation_path = os.path.join(OUTPUT_DIR, "ild_talisman_validation.npz")
-    _atomic_save_npz(train_path, train_arrays)
-    _atomic_save_npz(validation_path, validation_arrays)
-
-    train_core = train_arrays["labels"]
-    val_core = validation_arrays["labels"]
+    source_values = arrays["sources"]
+    patient_ids = arrays["patient_ids"]
+    real_tal_ids = set(map(int, patient_ids[(source_values == "talisman") & (patient_ids >= 0)]))
+    volume_ids = set(map(int, patient_ids[source_values == "volume"]))
+    overlap_ids = real_tal_ids & volume_ids
+    labels = arrays["labels"]
     summary = {
-        "train_file": train_path,
-        "validation_file": validation_path,
-        "train_patches": int(len(train_core)),
-        "validation_talisman_patches": int(len(val_core)),
-        "volume_patches_excluded_for_talisman_patient_overlap": 0,
-        "talisman_patient_ids_excluded_from_validation_for_training_overlap": int(len(overlap_ids)),
-        "talisman_validation_patient_ids_retained": int(len(set(validation_arrays["patient_ids"].tolist()))),
-        "candidate_volume_numeric_patient_ids": int(len(volume_patient_ids)),
-        "numeric_ids_overlapping_validation_and_volume": int(len(overlap_ids)),
-        "train_numeric_patient_ids": int(len(set(train_arrays["patient_ids"].tolist()) - {-1})),
-        "talisman_training_only_sentinel_patches_excluded": int(sentinel_count if not include_talisman_sentinel_train else 0),
-        "talisman_training_only_sentinel_patches_included": int(sentinel_count if include_talisman_sentinel_train else 0),
-        "include_talisman_sentinel_train": bool(include_talisman_sentinel_train),
+        "combined_file": combined_path,
+        "combined_patches": int(len(labels)),
+        "talisman_patches_including_sentinels": int(np.sum(source_values == "talisman")),
+        "volume_and_pilot_patches": int(np.sum(source_values == "volume")),
+        "talisman_sentinel_patches_patient_minus_one": int(sentinel_count),
+        "real_talisman_patient_ids": int(len(real_tal_ids)),
+        "volume_and_pilot_patient_ids_with_patches": int(len(volume_ids)),
+        "same_patient_ids_across_talisman_and_volume": int(len(overlap_ids)),
+        "all_shared_patient_ids_grouped_together": True,
+        "sentinel_split_policy": "patient_id -1 rows are forced into training after the 75/25 real-patient GroupShuffleSplit",
         "patch_shape": [PATCH_SIZE, PATCH_SIZE],
         "patch_stride": PATCH_STRIDE,
         "hu_window": [HU_MIN, HU_MAX],
-        "train_extended_label_counts": {name: int(np.sum(train_arrays["extended_labels"] == name)) for name in EXTENDED_LABELS.values()},
-        "validation_class_counts": {name: int(np.sum(val_core == idx)) for name, idx in CORE_LABELS.items()},
-        "patient_overlap_policy": "keep all volume and HRCT pilot cases for training; exclude matching numeric IDs from Talisman validation",
-        "patient_count_note": "Counts are source identifiers; confirm the stated cohort count separately.",
+        "combined_core_label_counts": {name: int(np.sum(labels == idx)) for name, idx in CORE_LABELS.items()},
+        "combined_extended_label_counts": {name: int(np.sum(arrays["extended_labels"] == name)) for name in EXTENDED_LABELS.values()},
+        "patient_overlap_policy": "all sources with the same patient ID are assigned to the same GroupShuffleSplit partition",
+        "patient_count_note": "Counts describe IDs with extracted rows; GroupShuffleSplit is applied to unique non-sentinel patient IDs.",
     }
     summary_path = os.path.join(OUTPUT_DIR, "dataset_summary.json")
     with open(summary_path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     os.replace(summary_path + ".tmp", summary_path)
-    print(f"Training NPZ: {train_path} ({summary['train_patches']} patches)")
-    print(f"Talisman validation NPZ: {validation_path} ({summary['validation_talisman_patches']} patches)")
-    print(f"Excluded {len(overlap_ids)} matching patient IDs from Talisman validation")
+    print(f"Combined NPZ: {combined_path} ({summary['combined_patches']} patches)")
+    print(f"Talisman-volume shared patient IDs: {len(overlap_ids)}; grouped together by patient ID")
+    print(f"Sentinel (-1) patches reserved for training: {sentinel_count}")
     return summary
 
 
@@ -409,8 +387,6 @@ if __name__ == "__main__":
     parser.add_argument("--base_dir", default=BASE_DIR)
     parser.add_argument("--output_dir", default=OUTPUT_DIR)
     parser.add_argument("--stride", type=int, default=PATCH_STRIDE)
-    parser.add_argument("--include_talisman_sentinel_train", action="store_true",
-                        help="Include patient -1 sentinel patches in training (off by default)")
     parser.add_argument("--patient_limit", type=int, default=0,
                         help="Process only the first N volume cases; intended for smoke checks")
     parser.add_argument("--talisman_limit", type=int, default=0,
@@ -426,10 +402,8 @@ if __name__ == "__main__":
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print("ILD Dataset — Step 2: Patch Extraction & Packaging")
     print("=" * 60)
-    summary = standardize_and_package(args.include_talisman_sentinel_train,
-                                      args.patient_limit, args.talisman_limit)
+    summary = standardize_and_package(args.patient_limit, args.talisman_limit)
     print("\n" + "=" * 60)
     print("PIPELINE COMPLETE!")
     print("=" * 60)
-    print(f"Training patches: {summary['train_patches']}")
-    print(f"Validation patches: {summary['validation_talisman_patches']}")
+    print(f"Combined patches: {summary['combined_patches']}")

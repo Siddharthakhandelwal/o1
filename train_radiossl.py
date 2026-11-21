@@ -404,9 +404,9 @@ class SSLDataset(Dataset):
         if torch.rand(1).item() > 0.5: x = torch.flip(x, [1])
         x = torch.rot90(x, torch.randint(0, 4, (1,)).item(), [1, 2])
 
-        # Gaussian noise (σ=0.015 ≈ 15 HU, within scanner noise)
+        # Gaussian noise with σ≈15 HU in normalized [-1024, 600] units.
         if torch.rand(1).item() > 0.30:
-            x = x + torch.randn_like(x) * 0.015
+            x = x + torch.randn_like(x) * (15.0 / (600.0 - (-1024.0)))
 
         # Mean-filled cutout (1-3 regions)
         if torch.rand(1).item() > 0.40:
@@ -554,45 +554,28 @@ def cosine_momentum(epoch, total_epochs, base=0.990, final=0.999):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 @torch.no_grad()
-def linear_probe(encoder, patches, labels, patient_ids, device):
-    """
-    Patient-grouped linear probe using GroupShuffleSplit.
-
-    WHY THIS MATTERS:
-      v2 used StratifiedShuffleSplit which puts patches from the SAME patient
-      in both train and test. The ResNet34 stem learns patient-specific HU
-      signatures from the very first epoch (scanner protocol, noise level),
-      so the probe trivially achieves 70%+ at epoch 1 by memorising which
-      patient each patch comes from.
-
-      This patient-aware probe uses GroupShuffleSplit to ensure NO patient
-      appears in both train and test. The numbers will be ~10-20% lower than
-      the old probe but they are HONEST and directly match the CV protocol
-      of the downstream fine-tuner.
-
-      Training should optimise for these honest numbers, not the inflated ones.
-    """
+def linear_probe(encoder, train_patches, train_labels, test_patches, test_labels, device):
+    """Fit a linear probe on the manifest's train patients and score its holdout."""
     from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import GroupShuffleSplit
     from sklearn.metrics import accuracy_score, f1_score
 
     encoder.eval()
-    feats = []
-    for i in range(0, len(patches), 256):
-        b = torch.from_numpy(patches[i:i + 256]).unsqueeze(1).to(device)
-        feats.append(encoder(b).cpu().numpy())
-    feats = np.concatenate(feats, 0)
+    def encode(patches):
+        chunks = []
+        for i in range(0, len(patches), 256):
+            batch = torch.from_numpy(patches[i:i + 256]).unsqueeze(1).to(device)
+            chunks.append(encoder(batch).cpu().numpy())
+        return np.concatenate(chunks, axis=0)
 
-    # Patient-grouped split — no patient in both train and test
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=SEED)
-    tr, te = next(gss.split(feats, labels, groups=patient_ids))
+    train_features = encode(train_patches)
+    test_features = encode(test_patches)
 
     clf = LogisticRegression(max_iter=1000, C=1.0, random_state=SEED,
                              class_weight="balanced")
-    clf.fit(feats[tr], labels[tr])
-    preds = clf.predict(feats[te])
-    return accuracy_score(labels[te], preds), f1_score(labels[te], preds,
-                                                       average="macro")
+    clf.fit(train_features, train_labels)
+    preds = clf.predict(test_features)
+    return accuracy_score(test_labels, preds), f1_score(test_labels, preds,
+                                                         average="macro")
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -639,7 +622,8 @@ def train(args):
     if torch.cuda.is_available():
         print(f"  GPU            : {torch.cuda.get_device_name(0)}")
     print(f"  Architecture   : ResNet34 Stem -> {args.depth} Transformer blocks")
-    print(f"  SSL Objectives : MoCo v3 + SupCon (alpha={args.alpha_supcon}) + Radiomics")
+    print(f"  SSL Objectives : MoCo v3 + SupCon from epoch {args.supcon_start_epoch} "
+          f"(alpha={args.alpha_supcon}) + Radiomics")
     print(f"  Views          : 1 global + 2 local (triple-view)")
     print(f"  Evaluation     : manifest-defined holdout; evaluate after training")
     print(f"  Epochs         : {args.epochs}  (warmup={args.warmup_epochs})")
@@ -674,7 +658,10 @@ def train(args):
         raise ValueError("Train/test patient IDs overlap")
     patches = data["patches"][train_idx].astype(np.float32)
     labels_all = data["labels"][train_idx].astype(np.int64)
-    patient_ids = all_pids[train_idx]
+    test_labels_all = data["labels"][test_idx].astype(np.int64)
+    probe_test_mask = (test_labels_all >= 0) & (test_labels_all <= 4)
+    probe_test_patches = data["patches"][test_idx][probe_test_mask].astype(np.float32)
+    probe_test_labels = test_labels_all[probe_test_mask]
     radiomics = data["radiomics"][train_idx].astype(np.float32) if "radiomics" in data else None
     del data, all_pids
 
@@ -692,7 +679,6 @@ def train(args):
         ok = ~bad
         patches = patches[ok]
         if labels_all  is not None: labels_all  = labels_all[ok]
-        if patient_ids is not None: patient_ids = patient_ids[ok]
         if radiomics   is not None: radiomics   = radiomics[ok]
     np.nan_to_num(patches, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
 
@@ -706,6 +692,10 @@ def train(args):
     ssl_labels = labels_all if labels_all is not None else -np.ones(len(patches), dtype=np.int64)
     # Mark out-of-range labels as unlabelled
     ssl_labels = np.where((ssl_labels >= 0) & (ssl_labels <= 4), ssl_labels, -1)
+
+    probe_train_mask = (labels_all >= 0) & (labels_all <= 4)
+    probe_train_patches = patches[probe_train_mask].copy()
+    probe_train_labels = labels_all[probe_train_mask].copy()
 
     dataset = SSLDataset(patches, labels=ssl_labels, radiomics=radiomics)
     sampler = make_class_balanced_sampler(ssl_labels)
@@ -799,11 +789,14 @@ def train(args):
                     contrastive_loss(q2, k1.detach(), args.temperature)
                 ) / 2.0
 
-                # ── SupCon loss on labelled patches ───────────────────────────
-                # z1, z2, z3 are projections from all 3 views (pre-norm in head)
-                # SupCon uses lower temperature (0.07) than MoCo (0.1)
-                z_views = [z for z in [z1, z2, z3] if z is not None]
-                l_sup   = supcon_loss(z_views, lbl, temperature=args.temp_supcon)
+                # ── SupCon begins at the epoch-200 stage described in the paper.
+                if epoch >= args.supcon_start_epoch:
+                    z_views = [z for z in [z1, z2, z3] if z is not None]
+                    l_sup = supcon_loss(z_views, lbl, temperature=args.temp_supcon)
+                    supcon_weight = args.alpha_supcon
+                else:
+                    l_sup = torch.zeros((), device=device)
+                    supcon_weight = 0.0
 
                 # ── Radiomics prediction (Branch B) ───────────────────────────
                 if radiomics is not None:
@@ -812,7 +805,7 @@ def train(args):
                     l_rad = torch.tensor(0.0, device=device)
 
                 loss = (l_moco
-                        + args.alpha_supcon * l_sup
+                        + supcon_weight * l_sup
                         + args.lambda_radiomics * l_rad) / args.accum_steps
 
             if torch.isnan(loss) or torch.isinf(loss):
@@ -860,11 +853,20 @@ def train(args):
         avg_rad  = rad_ls  / max(n_batches, 1)
         elapsed  = time.time() - t0
 
-        # The locked test patients are never evaluated or used to select a checkpoint here.
+        probe_accuracy = probe_macro_f1 = None
+        if (len(probe_test_labels) and args.probe_every > 0
+                and (epoch % args.probe_every == 0 or epoch == args.epochs)):
+            probe_accuracy, probe_macro_f1 = linear_probe(
+                model.encoder, probe_train_patches, probe_train_labels,
+                probe_test_patches, probe_test_labels, device)
+            print(f"        patient-group probe: accuracy={probe_accuracy:.4f}, "
+                  f"macro-F1={probe_macro_f1:.4f}")
+
         log_data.append({
             "epoch": epoch, "loss_total": avg_tot, "loss_moco": avg_moco,
             "loss_supcon": avg_sup, "loss_radiomics": avg_rad,
-            "lr": lr,
+            "lr": lr, "probe_accuracy": probe_accuracy,
+            "probe_macro_f1": probe_macro_f1,
         })
 
         if epoch % 5 == 0 or epoch == start_epoch or epoch == args.epochs:
@@ -945,6 +947,8 @@ def parse_args():
                    help="SupCon temperature (lower = sharper boundaries)")
     p.add_argument("--alpha_supcon",    type=float, default=0.5,
                    help="Weight for SupCon loss (0=disabled, 1=equal to MoCo)")
+    p.add_argument("--supcon_start_epoch", type=int, default=200,
+                   help="First epoch that includes the SupCon objective")
     p.add_argument("--lambda_radiomics",type=float, default=1.0)
 
     # Evaluation

@@ -36,7 +36,8 @@ def audit(base_dir: Path, output: Path):
                            if pilot_root.is_dir() else set())
     volume_ids = regular_ids["volume_rois"]
     pilot_volume_ids = pilot_ids["volume_rois"]
-    overlap = tal_ids & volume_ids
+    all_volume_ids = volume_ids | pilot_volume_ids
+    overlap = tal_ids & all_volume_ids
 
     # DICOM PatientID is anonymized in the supplied files; do not use names or
     # UIDs as a person mapping. Report this limitation instead of asserting ID
@@ -65,12 +66,12 @@ def audit(base_dir: Path, output: Path):
         ),
         "numeric_id_overlap": sorted(overlap),
         "numeric_id_overlap_count": len(overlap),
-        "numeric_id_union_count_if_shared_namespace": len(tal_ids | volume_ids),
+        "numeric_id_union_count_if_shared_namespace": len(tal_ids | all_volume_ids),
         "numeric_namespaces_proven_same_patient": False,
         "clinical_workbook_status": "password-protected; not opened by this audit script",
         "sample_dicom_patient_id_is_anonymized": patient_id_value in ("Anonymous-ID", ""),
-        "status": "NUMERIC_ID_POLICY_APPLIED_CONSERVATIVELY",
-        "note": "The package keeps volume and HRCT pilot cases for training, then excludes exact matching numeric IDs from Talisman validation. Counts describe folder identifiers, not independently verified people.",
+        "status": "SHARED_NUMERIC_ID_GROUPING_ENABLED",
+        "note": "The pipeline groups matching numeric IDs across Talisman, volume and HRCT pilot sources in one 75/25 patient split; sentinel -1 rows are training-only. Counts describe folder identifiers, not extracted patches.",
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2), encoding="utf-8")
